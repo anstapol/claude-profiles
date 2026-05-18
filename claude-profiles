@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""claude-profiles: Switch between Claude Max accounts instantly.
+
+Usage:
+    claude-profiles save <name>       Save current credentials as a named profile
+    claude-profiles use <name>        Switch to a saved profile
+    claude-profiles list              List saved profiles
+    claude-profiles rm <name>         Remove a saved profile
+    claude-profiles rename <old> <new>  Rename a saved profile
+    claude-profiles current           Show which account is active
+
+Profile names may contain letters, digits, hyphens, and underscores.
+Profiles are stored in ~/.claude/profiles/<name>/
+Requires: macOS or Linux, Python 3.6+
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+PROFILES_DIR = os.path.expanduser("~/.claude/profiles")
+CLAUDE_JSON = os.path.expanduser("~/.claude.json")
+IS_MACOS = sys.platform == "darwin"
+
+if IS_MACOS:
+    KEYCHAIN_SERVICE = "Claude Code-credentials"
+    KEYCHAIN_ACCOUNT = os.environ.get("USER")
+    if not KEYCHAIN_ACCOUNT:
+        print("Error: $USER is not set. Cannot determine keychain account.", file=sys.stderr)
+        sys.exit(1)
+else:
+    CREDENTIALS_JSON = os.path.expanduser("~/.claude/.credentials.json")
+
+
+def validate_name(name):
+    if not name or not re.fullmatch(r'[a-zA-Z0-9_-]+', name):
+        print(f"Error: Invalid profile name '{name}'. Use only letters, digits, hyphens, and underscores.", file=sys.stderr)
+        sys.exit(1)
+
+
+def run(cmd, input_data=None):
+    r = subprocess.run(cmd, capture_output=True, text=True, input=input_data)
+    return r.returncode, r.stdout, r.stderr
+
+
+def read_credentials():
+    if IS_MACOS:
+        code, out, err = run([
+            "security", "find-generic-password",
+            "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w"
+        ])
+        if code != 0:
+            return None
+        return out.strip()
+    else:
+        try:
+            with open(CREDENTIALS_JSON, "r") as f:
+                return f.read().strip()
+        except FileNotFoundError:
+            return None
+
+
+def write_credentials(data):
+    if IS_MACOS:
+        run(["security", "delete-generic-password",
+             "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT])
+        code, _, err = run([
+            "security", "add-generic-password",
+            "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT,
+            "-w", data
+        ])
+        if code != 0:
+            print(f"Error writing keychain: {err}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        dir_name = os.path.dirname(CREDENTIALS_JSON)
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(data)
+                f.write("\n")
+            os.chmod(tmp_path, 0o600)
+            os.rename(tmp_path, CREDENTIALS_JSON)
+        except BaseException:
+            os.unlink(tmp_path)
+            raise
+
+
+def read_claude_json():
+    try:
+        with open(CLAUDE_JSON, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print("Error: ~/.claude.json not found — is Claude Code installed?", file=sys.stderr)
+        sys.exit(1)
+
+
+def write_claude_json(data):
+    tmp_dir = os.path.expanduser("~/.claude")
+    os.makedirs(tmp_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=tmp_dir, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.rename(tmp_path, CLAUDE_JSON)
+    except BaseException:
+        os.unlink(tmp_path)
+        raise
+
+
+def profile_dir(name):
+    return os.path.join(PROFILES_DIR, name)
+
+
+def cmd_save(name):
+    validate_name(name)
+    pdir = profile_dir(name)
+    if os.path.isdir(pdir):
+        resp = input(f"Profile '{name}' already exists. Overwrite? [y/N] ").strip().lower()
+        if resp not in ("y", "yes"):
+            print("Aborted.")
+            sys.exit(0)
+    os.makedirs(pdir, exist_ok=True)
+    os.chmod(pdir, 0o700)
+
+    creds_data = read_credentials()
+    if not creds_data:
+        print("No Claude credentials found. Are you logged in?", file=sys.stderr)
+        sys.exit(1)
+
+    creds_path = os.path.join(pdir, "credentials.json")
+    fd, tmp_path = tempfile.mkstemp(dir=pdir, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(creds_data)
+        os.chmod(tmp_path, 0o600)
+        os.rename(tmp_path, creds_path)
+    except BaseException:
+        os.unlink(tmp_path)
+        raise
+
+    cdata = read_claude_json()
+    account_info = {}
+    for key in ("oauthAccount", "hasAvailableSubscription"):
+        if key in cdata:
+            account_info[key] = cdata[key]
+
+    account_path = os.path.join(pdir, "account.json")
+    fd, tmp_path = tempfile.mkstemp(dir=pdir, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(account_info, f, indent=2)
+            f.write("\n")
+        os.chmod(tmp_path, 0o600)
+        os.rename(tmp_path, account_path)
+    except BaseException:
+        os.unlink(tmp_path)
+        raise
+
+    email = account_info.get("oauthAccount", {}).get("emailAddress", "unknown")
+    display = account_info.get("oauthAccount", {}).get("displayName", "")
+    try:
+        tier = json.loads(creds_data).get("claudeAiOauth", {}).get("rateLimitTier", "")
+    except (json.JSONDecodeError, AttributeError):
+        tier = ""
+
+    print(f"Saved profile '{name}': {display} <{email}> [{tier}]")
+
+
+def cmd_use(name):
+    validate_name(name)
+    pdir = profile_dir(name)
+    if not os.path.isdir(pdir):
+        print(f"Profile '{name}' not found. Use 'claude-profiles list' to see available profiles.", file=sys.stderr)
+        sys.exit(1)
+
+    creds_path = os.path.join(pdir, "credentials.json")
+    # Support legacy profiles that used the old filename
+    if not os.path.exists(creds_path):
+        legacy_path = os.path.join(pdir, "keychain.json")
+        if os.path.exists(legacy_path):
+            creds_path = legacy_path
+        else:
+            print(f"Error: Profile '{name}' is missing its credentials file.", file=sys.stderr)
+            sys.exit(1)
+    with open(creds_path, "r") as f:
+        creds_data = f.read().strip()
+
+    write_credentials(creds_data)
+
+    account_path = os.path.join(pdir, "account.json")
+    with open(account_path, "r") as f:
+        account_info = json.load(f)
+
+    cdata = read_claude_json()
+    for key in ("oauthAccount", "hasAvailableSubscription"):
+        if key in account_info:
+            cdata[key] = account_info[key]
+        elif key in cdata:
+            del cdata[key]
+
+    write_claude_json(cdata)
+
+    email = account_info.get("oauthAccount", {}).get("emailAddress", "unknown")
+    display = account_info.get("oauthAccount", {}).get("displayName", "")
+    print(f"Switched to '{name}': {display} <{email}>")
+    print("Restart Claude Code for changes to take effect.")
+
+
+def cmd_list():
+    if not os.path.isdir(PROFILES_DIR):
+        print("No profiles saved yet.")
+        return
+
+    profiles = sorted(d for d in os.listdir(PROFILES_DIR)
+                      if os.path.isdir(os.path.join(PROFILES_DIR, d)))
+    if not profiles:
+        print("No profiles saved yet.")
+        return
+
+    current_email = None
+    try:
+        cdata = read_claude_json()
+        current_email = cdata.get("oauthAccount", {}).get("emailAddress")
+    except Exception:
+        pass
+
+    for name in profiles:
+        acct_path = os.path.join(PROFILES_DIR, name, "account.json")
+        try:
+            with open(acct_path) as f:
+                info = json.load(f)
+            email = info.get("oauthAccount", {}).get("emailAddress", "?")
+            display = info.get("oauthAccount", {}).get("displayName", "")
+            active = " (active)" if email == current_email else ""
+            creds_path = os.path.join(PROFILES_DIR, name, "credentials.json")
+            if not os.path.exists(creds_path):
+                creds_path = os.path.join(PROFILES_DIR, name, "keychain.json")
+            tier = ""
+            try:
+                with open(creds_path) as f:
+                    creds = json.loads(f.read())
+                tier = creds.get("claudeAiOauth", {}).get("rateLimitTier", "")
+            except Exception:
+                pass
+            print(f"  {name:<16} {display} <{email}> [{tier}]{active}")
+        except Exception:
+            print(f"  {name:<16} (corrupt profile)")
+
+
+def cmd_rm(name):
+    validate_name(name)
+    pdir = profile_dir(name)
+    if not os.path.isdir(pdir):
+        print(f"Profile '{name}' not found.", file=sys.stderr)
+        sys.exit(1)
+
+    shutil.rmtree(pdir)
+    print(f"Removed profile '{name}'.")
+
+
+def cmd_rename(old, new):
+    validate_name(old)
+    validate_name(new)
+    old_dir = profile_dir(old)
+    new_dir = profile_dir(new)
+    if not os.path.isdir(old_dir):
+        print(f"Profile '{old}' not found.", file=sys.stderr)
+        sys.exit(1)
+    if os.path.exists(new_dir):
+        print(f"Profile '{new}' already exists.", file=sys.stderr)
+        sys.exit(1)
+    os.rename(old_dir, new_dir)
+    print(f"Renamed profile '{old}' to '{new}'.")
+
+
+def cmd_current():
+    try:
+        cdata = read_claude_json()
+        acct = cdata.get("oauthAccount", {})
+        email = acct.get("emailAddress", "unknown")
+        display = acct.get("displayName", "")
+
+        creds_data = read_credentials()
+        tier = ""
+        if creds_data:
+            tier = json.loads(creds_data).get("claudeAiOauth", {}).get("rateLimitTier", "")
+
+        print(f"{display} <{email}> [{tier}]")
+    except Exception as e:
+        print(f"Could not read current account: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__.strip())
+        sys.exit(0)
+
+    cmd = sys.argv[1]
+
+    if cmd == "save" and len(sys.argv) == 3:
+        cmd_save(sys.argv[2])
+    elif cmd == "use" and len(sys.argv) == 3:
+        cmd_use(sys.argv[2])
+    elif cmd == "list":
+        cmd_list()
+    elif cmd == "rm" and len(sys.argv) == 3:
+        cmd_rm(sys.argv[2])
+    elif cmd == "rename" and len(sys.argv) == 4:
+        cmd_rename(sys.argv[2], sys.argv[3])
+    elif cmd == "current":
+        cmd_current()
+    else:
+        print(__doc__.strip())
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
