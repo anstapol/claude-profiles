@@ -37,6 +37,13 @@ claude-profiles save personal
 claude-profiles use work
 claude-profiles use personal
 
+# Re-save the active account's (refreshed) tokens into an existing profile.
+# Refuses unless the active account matches the profile.
+claude-profiles refresh work
+
+# Overwrite an existing profile without the confirmation prompt
+claude-profiles save work -y
+
 # List all profiles
 claude-profiles list
 
@@ -52,9 +59,15 @@ claude-profiles rm old-account
 
 Restart Claude Code after switching for changes to take effect.
 
+## Why not just `/login`?
+
+`/login` opens your default browser and adopts whatever account is signed into claude.ai there — so if that session doesn't match the account you intended, it silently swaps you. `claude-profiles use <name>` restores credentials directly, with no browser round-trip, so the switch is deterministic regardless of browser state.
+
 ## How it works
 
 Claude Code stores auth in two places — OAuth tokens and account metadata in **~/.claude.json**. On macOS, tokens go in the **macOS Keychain**; on Linux, they live in **~/.claude/.credentials.json**. `claude-profiles` saves and restores both. Profiles live in `~/.claude/profiles/<name>/`.
+
+On switch, per-account caches in `~/.claude.json` (feature flags, billing eligibility, etc.) are also cleared so Claude Code re-fetches them for the new account on next startup, instead of carrying the previous account's state across.
 
 ## Security
 
